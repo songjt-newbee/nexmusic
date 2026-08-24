@@ -28,6 +28,7 @@ import { useCatalogStore } from "@/stores/catalog-store";
 import {
   PLAY_MODE_LABEL,
   PROVIDERS,
+  UI_PROVIDERS,
   type LikedSortKey,
   type MusicProvider,
   type PlayMode,
@@ -256,14 +257,20 @@ function NowPlaying() {
   const playMode = useMusicStore((s) => s.playMode);
   const cyclePlayMode = useMusicStore((s) => s.cyclePlayMode);
   const setQueueOpen = useMusicStore((s) => s.setQueueOpen);
-  const [showLyrics, setShowLyrics] = useState(false);
   const lines = useMemo(() => buildKaraokeLines(lyrics), [lyrics]);
   const active = lines.findIndex((l, i) => currentTime >= l.time && currentTime < (lines[i + 1]?.time ?? 1e9));
+  const coverUrl = song ? coverProxyUrl(song.cover, proxyPort) : "";
+  const activeLineRef = useRef<HTMLParagraphElement | null>(null);
+
+  useEffect(() => {
+    if (!open || active < 0) return;
+    activeLineRef.current?.scrollIntoView({ behavior: "smooth", block: "center" });
+  }, [active, open]);
 
   if (!open || !song) return null;
 
   return (
-    <div className="overlay">
+    <div className="overlay now-playing">
       <div className="topbar">
         <button className="icon-btn" onClick={() => setNowPlayingOpen(false)}>
           <ChevronLeft />
@@ -273,32 +280,36 @@ function NowPlaying() {
           <ListMusic />
         </button>
       </div>
-      {!showLyrics ? (
-        <img
-          className="now-cover"
-          src={coverProxyUrl(song.cover, proxyPort)}
-          alt=""
-          onClick={() => setShowLyrics(true)}
-        />
-      ) : (
-        <div className="lyrics" onClick={() => setShowLyrics(false)}>
-          {lines.length === 0 ? <p>暂无歌词</p> : null}
+
+      <div
+        className="now-playing-lyrics"
+        style={{ backgroundImage: coverUrl ? `url("${coverUrl}")` : undefined }}
+      >
+        <div className="now-playing-lyrics-inner lyrics">
+          {lines.length === 0 ? <p className="empty-lyrics">暂无歌词</p> : null}
           {lines.map((line, i) => (
-            <p key={`${line.time}-${i}`} className={i === active ? "active" : ""}>
+            <p
+              key={`${line.time}-${i}`}
+              ref={i === active ? activeLineRef : undefined}
+              className={i === active ? "active" : ""}
+            >
               {line.text}
               {line.translation ? (
                 <>
                   <br />
-                  <span style={{ fontSize: 12 }}>{line.translation}</span>
+                  <span className="lyric-trans">{line.translation}</span>
                 </>
               ) : null}
             </p>
           ))}
         </div>
-      )}
-      <div style={{ padding: "0 24px 12px", textAlign: "center" }}>
-        <b style={{ fontSize: 20 }}>{song.name}</b>
-        <div style={{ color: "var(--muted)", marginTop: 6 }}>{song.artist}</div>
+      </div>
+
+      <div className="now-playing-controls">
+        <div className="now-playing-meta">
+          <b>{song.name}</b>
+          <span>{song.artist}</span>
+        </div>
         <input
           className="progress"
           type="range"
@@ -308,7 +319,7 @@ function NowPlaying() {
           value={currentTime || 0}
           onChange={(e) => seek(Number(e.target.value))}
         />
-        <div style={{ display: "flex", justifyContent: "space-between", color: "var(--muted)", fontSize: 12 }}>
+        <div className="progress-times">
           <span>{fmt(currentTime)}</span>
           <span>{fmt(duration)}</span>
         </div>
@@ -322,17 +333,10 @@ function NowPlaying() {
           <button onClick={nextTrack}>
             <SkipForward />
           </button>
-          <button
-            className="mode-btn"
-            title={PLAY_MODE_LABEL[playMode]}
-            onClick={() => cyclePlayMode()}
-          >
+          <button className="mode-btn" title={PLAY_MODE_LABEL[playMode]} onClick={() => cyclePlayMode()}>
             <PlayModeIcon mode={playMode} />
           </button>
         </div>
-        <button className="ghost" onClick={() => setShowLyrics((v) => !v)}>
-          {showLyrics ? "封面" : "歌词"}
-        </button>
       </div>
     </div>
   );
@@ -376,6 +380,8 @@ export default function App() {
   const likedSortAsc = useMusicStore((s) => s.likedSortAsc);
   const setLikedSort = useMusicStore((s) => s.setLikedSort);
   const openPlaylistFromSongs = useMusicStore((s) => s.openPlaylistFromSongs);
+  const cacheMode = useMusicStore((s) => s.cacheMode);
+  const setCacheMode = useMusicStore((s) => s.setCacheMode);
   const catalogInit = useCatalogStore((s) => s.init);
   const maybeAutoSync = useCatalogStore((s) => s.maybeAutoSync);
   const catalogCache = useCatalogStore((s) => s.cache);
@@ -407,7 +413,7 @@ export default function App() {
       <div className="topbar">
         <span className="brand">NexMusic</span>
         <div className="provider-switch">
-          {PROVIDERS.map((p) => (
+          {UI_PROVIDERS.map((p) => (
             <button
               key={p.id}
               className={playbackSource === p.id ? "active" : ""}
@@ -457,6 +463,17 @@ export default function App() {
             <p className="empty">{playlistsError}</p>
           ) : (
             <>
+              <div className="cache-setting">
+                <label>
+                  <input
+                    type="checkbox"
+                    checked={cacheMode === "after_play"}
+                    onChange={(e) => setCacheMode(e.target.checked ? "after_play" : "off")}
+                  />
+                  <span>播完后缓存到本机</span>
+                </label>
+                <p>开启后整首播完才下载，不占首播速度；需足够磁盘空间</p>
+              </div>
               <div className="section-title">我的歌单</div>
               <LikedSyncBar />
               {playlists.length === 0 ? <p className="empty">还没有收藏歌单</p> : null}

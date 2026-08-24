@@ -1,4 +1,6 @@
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::path::PathBuf;
+use std::sync::OnceLock;
 
 use axum::{
     body::Body,
@@ -10,7 +12,8 @@ use axum::{
 };
 use futures_util::StreamExt;
 use serde::Deserialize;
-use std::sync::OnceLock;
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio_util::io::ReaderStream;
 use tauri::AppHandle;
 
 static PROXY_PORT: AtomicU16 = AtomicU16::new(0);
@@ -79,9 +82,117 @@ fn content_type_for(url: &str) -> &'static str {
     }
 }
 
+fn resolve_stream_content_type(upstream: Option<&str>, audio_url: &str) -> String {
+    if let Some(raw) = upstream {
+        let ct = raw.split(';').next().unwrap_or(raw).trim().to_lowercase();
+        if ct.starts_with("audio/") {
+            return ct;
+        }
+        if ct == "application/octet-stream" {
+            return content_type_for(audio_url).to_string();
+        }
+    }
+    content_type_for(audio_url).to_string()
+}
+
 /// 将 reqwest HeaderValue 转换为 axum HeaderValue
 fn convert_header_value(val: &reqwest::header::HeaderValue) -> HeaderValue {
     HeaderValue::from_bytes(val.as_bytes()).unwrap_or(HeaderValue::from_static(""))
+}
+
+#[derive(Deserialize)]
+struct CacheQuery {
+    key: String,
+}
+
+/// 本机音频缓存文件（仅允许 audio-cache 目录内、key 合法）
+async fn cache_proxy(Query(query): Query<CacheQuery>, headers: HeaderMap) -> Response {
+    let key = query.key.trim();
+    if key.is_empty() || key.len() > 200 || !key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-') {
+        return (StatusCode::BAD_REQUEST, "Invalid cache key").into_response();
+    }
+
+    let path: PathBuf = match super::audio_cache::cache_file_path(key) {
+        Ok(Some(p)) => p,
+        Ok(None) => return (StatusCode::NOT_FOUND, "Cache miss").into_response(),
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response(),
+    };
+
+    let mut file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(e) => {
+            log::warn!("[AudioProxy] cache open failed: {e}");
+            return (StatusCode::NOT_FOUND, "Cache file missing").into_response();
+        }
+    };
+
+    let meta = match file.metadata().await {
+        Ok(m) => m,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Metadata error").into_response(),
+    };
+    let total = meta.len();
+
+    let (start, end) = if let Some(range) = headers.get("range").and_then(|r| r.to_str().ok()) {
+        if let Some(spec) = range.strip_prefix("bytes=") {
+            let parts: Vec<&str> = spec.split('-').collect();
+            if parts.len() == 2 {
+                let s: u64 = parts[0].parse().unwrap_or(0);
+                let e: u64 = if parts[1].is_empty() {
+                    total.saturating_sub(1)
+                } else {
+                    parts[1].parse().unwrap_or(total.saturating_sub(1)).min(total.saturating_sub(1))
+                };
+                (s, e)
+            } else {
+                (0, total.saturating_sub(1))
+            }
+        } else {
+            (0, total.saturating_sub(1))
+        }
+    } else {
+        (0, total.saturating_sub(1))
+    };
+
+    let mut out_headers = HeaderMap::new();
+    let ct = super::audio_cache::content_type_for_path(&path);
+    out_headers.insert("Content-Type", HeaderValue::from_static(ct));
+    out_headers.insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
+    out_headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
+
+    let status = if start > 0 || end + 1 < total {
+        out_headers.insert(
+            "Content-Range",
+            HeaderValue::from_str(&format!("bytes {start}-{end}/{total}"))
+                .unwrap_or(HeaderValue::from_static("")),
+        );
+        out_headers.insert(
+            "Content-Length",
+            HeaderValue::from_str(&(end - start + 1).to_string()).unwrap_or(HeaderValue::from_static("0")),
+        );
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        out_headers.insert(
+            "Content-Length",
+            HeaderValue::from_str(&total.to_string()).unwrap_or(HeaderValue::from_static("0")),
+        );
+        StatusCode::OK
+    };
+
+    if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
+        log::warn!("[AudioProxy] cache seek failed: {e}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Seek error").into_response();
+    }
+
+    let limited = file.take(end - start + 1);
+    let stream = ReaderStream::new(limited).map(|result| {
+        result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    });
+    let body = Body::from_stream(stream);
+
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    response.headers_mut().extend(out_headers);
+    response
 }
 
 /// 音频代理 - 支持 Range 请求，纯流式透传（零额外开销）
@@ -118,7 +229,12 @@ async fn audio_proxy(Query(query): Query<ProxyQuery>, headers: HeaderMap) -> Res
     let status = StatusCode::from_u16(resp.status().as_u16()).unwrap_or(StatusCode::OK);
     let mut out_headers = HeaderMap::new();
 
-    out_headers.insert("Content-Type", HeaderValue::from_static(content_type_for(audio_url)));
+    let upstream_ct = resp.headers().get("content-type").and_then(|v| v.to_str().ok());
+    let ct = resolve_stream_content_type(upstream_ct, audio_url);
+    out_headers.insert(
+        "Content-Type",
+        HeaderValue::from_str(&ct).unwrap_or_else(|_| HeaderValue::from_static("audio/mpeg")),
+    );
     out_headers.insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
     out_headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
 
@@ -200,6 +316,7 @@ pub async fn start_audio_proxy() -> Result<u16, String> {
 
     let app = Router::new()
         .route("/audio", get(audio_proxy))
+        .route("/cache", get(cache_proxy))
         .route("/cover", get(cover_proxy));
 
     // 找一个可用端口

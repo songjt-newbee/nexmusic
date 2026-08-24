@@ -1,5 +1,6 @@
 #![allow(dead_code, unused_imports)]
 
+pub mod audio_cache;
 pub mod audio_proxy;
 pub mod cookie;
 pub mod crypto;

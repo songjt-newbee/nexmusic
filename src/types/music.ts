@@ -113,3 +113,6 @@ export const PROVIDERS: { id: MusicProvider; name: string }[] = [
   { id: "netease", name: "网易云" },
   { id: "kugou", name: "酷狗" },
 ];
+
+/** 顶栏展示的平台（网易/酷狗登录逻辑保留，仅 UI 隐藏） */
+export const UI_PROVIDERS: { id: MusicProvider; name: string }[] = [{ id: "qqmusic", name: "QQ 音乐" }];

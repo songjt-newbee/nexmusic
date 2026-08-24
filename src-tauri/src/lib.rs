@@ -101,6 +101,8 @@ pub fn run() {
             music_api::music_switch_provider,
             music_api::music_get_playback_source,
             music_api::audio_proxy::cmd_get_proxy_port,
+            music_api::audio_cache::audio_cache_lookup,
+            music_api::audio_cache::audio_cache_download,
             catalog::catalog_load,
             catalog::catalog_save,
             catalog::catalog_has_deepseek_key,

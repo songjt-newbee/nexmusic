@@ -21,6 +21,8 @@ src-tauri/gen/
 music-cookies.json
 nexmusic-liked-cache.json
 
+# Local audio cache lives under %AppData%/top.nexmusic.app/audio-cache/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

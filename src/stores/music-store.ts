@@ -29,12 +29,6 @@ function isKeptPlaylist(pl: Playlist): boolean {
   return /喜欢|我喜欢|like/i.test(pl.name);
 }
 
-async function proxyAudioUrl(rawUrl: string, proxyPort: number): Promise<string> {
-  let port = proxyPort;
-  if (!port) port = await invoke<number>("cmd_get_proxy_port");
-  return `http://127.0.0.1:${port}/audio?url=${encodeURIComponent(rawUrl)}`;
-}
-
 export function coverProxyUrl(url: string, proxyPort: number): string {
   if (!url || url.startsWith("data:")) return url;
   if (!proxyPort) return url;
@@ -56,6 +50,49 @@ function invokeErrorMessage(e: unknown): string {
 }
 
 const PLAY_COUNT_KEY = "nexmusic-play-counts";
+
+export type CacheMode = "off" | "after_play";
+
+const CACHE_MODE_KEY = "nexmusic-cache-mode";
+
+interface PlaybackCacheMeta {
+  provider: string;
+  songId: string;
+  quality: string;
+  remoteUrl: string;
+}
+
+function loadCacheMode(): CacheMode {
+  try {
+    const raw = localStorage.getItem(CACHE_MODE_KEY);
+    return raw === "after_play" ? "after_play" : "off";
+  } catch {
+    return "off";
+  }
+}
+
+function saveCacheMode(mode: CacheMode) {
+  try {
+    localStorage.setItem(CACHE_MODE_KEY, mode);
+  } catch {
+    /* quota / private mode */
+  }
+}
+
+function proxyStreamUrl(rawUrl: string, proxyPort: number): string {
+  return `http://127.0.0.1:${proxyPort}/audio?url=${encodeURIComponent(rawUrl)}`;
+}
+
+function triggerAfterPlayCache(meta: PlaybackCacheMeta | null) {
+  if (!meta || !isTauri()) return;
+  void invoke("audio_cache_download", {
+    provider: meta.provider,
+    songId: meta.songId,
+    quality: meta.quality,
+    remoteUrl: meta.remoteUrl,
+  }).catch(() => {});
+}
+
 
 function songKey(song: Pick<Song, "provider" | "id">): string {
   return `${song.provider}:${song.id}`;
@@ -163,6 +200,8 @@ interface MusicState {
   likedSortKey: LikedSortKey;
   likedSortAsc: boolean;
   queueOpen: boolean;
+  cacheMode: CacheMode;
+  lastPlaybackCache: PlaybackCacheMeta | null;
 
   init: () => Promise<void>;
   setAudioRef: (el: HTMLAudioElement | null) => void;
@@ -184,6 +223,7 @@ interface MusicState {
   moveInQueue: (from: number, to: number) => void;
   clearQueue: () => void;
   setQueueOpen: (open: boolean) => void;
+  setCacheMode: (mode: CacheMode) => void;
   togglePlay: () => Promise<void>;
   cyclePlayMode: () => void;
   nextTrack: () => void;
@@ -225,6 +265,8 @@ export const useMusicStore = create<MusicState>((set, get) => ({
   likedSortKey: "addedAt",
   likedSortAsc: false,
   queueOpen: false,
+  cacheMode: loadCacheMode(),
+  lastPlaybackCache: null,
 
   init: async () => {
     try {
@@ -236,8 +278,15 @@ export const useMusicStore = create<MusicState>((set, get) => ({
 
     try {
       const saved = await invoke<string>("music_get_playback_source");
-      if (saved === "netease" || saved === "kugou" || saved === "qqmusic") {
-        set({ playbackSource: saved });
+      if (saved === "qqmusic") {
+        set({ playbackSource: "qqmusic" });
+      } else if (saved === "netease" || saved === "kugou") {
+        set({ playbackSource: "qqmusic" });
+        try {
+          await invoke("music_switch_provider", { provider: "qqmusic" });
+        } catch {
+          /* ignore */
+        }
       }
     } catch {
       /* ignore */
@@ -345,6 +394,9 @@ export const useMusicStore = create<MusicState>((set, get) => ({
         el.currentTime = 0;
         el.play().catch(() => {});
         return;
+      }
+      if (get().cacheMode === "after_play") {
+        triggerAfterPlayCache(get().lastPlaybackCache);
       }
       get().nextTrack();
     });
@@ -564,7 +616,7 @@ export const useMusicStore = create<MusicState>((set, get) => ({
     void loadLyric();
 
     try {
-      const quality = "exhigh";
+      const quality = song.provider === "qqmusic" ? "hires" : "exhigh";
       const result =
         song.provider === "kugou"
           ? await invoke<SongUrlResult>("kugou_song_url", {
@@ -597,12 +649,53 @@ export const useMusicStore = create<MusicState>((set, get) => ({
         return;
       }
 
-      const audioUrl = await proxyAudioUrl(result.url, get().proxyPort);
-      if (mySeq !== playSeq) return;
+      const { cacheMode } = get();
+      let proxyPort = get().proxyPort;
+      if (!proxyPort) {
+        try {
+          proxyPort = await invoke<number>("cmd_get_proxy_port");
+          set({ proxyPort });
+        } catch {
+          set({ isPlaying: false, toast: "音频代理未启动" });
+          return;
+        }
+      }
+
+      const playbackMeta: PlaybackCacheMeta = {
+        provider: song.provider,
+        songId: song.id,
+        quality,
+        remoteUrl: result.url,
+      };
+
+      let audioUrl: string;
+      if (cacheMode === "after_play") {
+        const lookup = await invoke<{ hit: boolean; url: string }>("audio_cache_lookup", {
+          provider: song.provider,
+          songId: song.id,
+          quality,
+        });
+        if (mySeq !== playSeq) return;
+        audioUrl = lookup.hit ? lookup.url : proxyStreamUrl(result.url, proxyPort);
+      } else {
+        audioUrl = proxyStreamUrl(result.url, proxyPort);
+      }
+
       audio.src = audioUrl;
       audio.volume = get().volume;
-      await audio.play();
-      set({ isPlaying: true });
+      try {
+        await audio.play();
+      } catch (playErr) {
+        if (mySeq !== playSeq) return;
+        const msg =
+          playErr instanceof DOMException && playErr.name === "NotSupportedError"
+            ? "无法播放该音质，请检查登录状态或稍后重试"
+            : String(playErr);
+        set({ isPlaying: false, toast: msg });
+        publishMediaSession({ currentSong: song, isPlaying: false, currentTime: 0, duration: 0 });
+        return;
+      }
+      set({ isPlaying: true, lastPlaybackCache: playbackMeta });
       publishMediaSession({
         currentSong: song,
         isPlaying: true,
@@ -688,6 +781,11 @@ export const useMusicStore = create<MusicState>((set, get) => ({
   clearQueue: () => set({ playQueue: [], currentIndex: 0, queueOpen: true }),
 
   setQueueOpen: (open) => set({ queueOpen: open }),
+
+  setCacheMode: (mode) => {
+    saveCacheMode(mode);
+    set({ cacheMode: mode });
+  },
 
   togglePlay: async () => {
     const { audioRef, isPlaying, currentSong } = get();

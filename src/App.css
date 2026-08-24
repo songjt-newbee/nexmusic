@@ -233,6 +233,29 @@ input {
   letter-spacing: 0.08em;
 }
 
+.cache-setting {
+  margin: 8px 0 4px;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.04);
+  border: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.cache-setting label {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+.cache-setting p {
+  margin: 8px 0 0 28px;
+  font-size: 12px;
+  color: var(--muted);
+  line-height: 1.45;
+}
+
 .playlist-row,
 .song-row {
   display: flex;
@@ -342,6 +365,76 @@ input {
   z-index: 20;
   display: flex;
   flex-direction: column;
+}
+
+.now-playing {
+  background: #0a0a0a;
+}
+
+.now-playing-lyrics {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  background-size: cover;
+  background-position: center;
+  background-color: #151515;
+}
+
+.now-playing-lyrics::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  backdrop-filter: blur(28px);
+  -webkit-backdrop-filter: blur(28px);
+}
+
+.now-playing-lyrics-inner {
+  position: relative;
+  z-index: 1;
+  height: 100%;
+  padding-top: 12px;
+}
+
+.now-playing-controls {
+  flex-shrink: 0;
+  padding: 16px 20px 20px;
+  background: linear-gradient(to top, #111 85%, transparent);
+  border-top: 1px solid #ffffff10;
+}
+
+.now-playing-meta {
+  text-align: center;
+  margin-bottom: 12px;
+}
+
+.now-playing-meta b {
+  display: block;
+  font-size: 18px;
+  margin-bottom: 4px;
+}
+
+.now-playing-meta span {
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.progress-times {
+  display: flex;
+  justify-content: space-between;
+  color: var(--muted);
+  font-size: 12px;
+  margin: 4px 0 0;
+}
+
+.empty-lyrics {
+  color: var(--muted);
+  margin-top: 40%;
+}
+
+.lyric-trans {
+  font-size: 12px;
+  opacity: 0.85;
 }
 
 .overlay .topbar .brand {
@@ -477,6 +570,7 @@ input {
   color: var(--accent);
   font-weight: 700;
   font-size: 18px;
+  scroll-margin-block: 40%;
 }
 
 .sheet {

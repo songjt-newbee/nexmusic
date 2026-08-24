@@ -2456,6 +2456,7 @@ dependencies = [
  "tauri-plugin-opener",
  "tauri-plugin-store",
  "tokio",
+ "tokio-util",
  "url",
  "urlencoding",
 ]

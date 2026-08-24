@@ -13,15 +13,15 @@ export default defineConfig(async () => ({
   },
   clearScreen: false,
   server: {
-    // 1420/1421 常落在 Windows Hyper-V 保留端口段，导致 EACCES
-    port: 5173,
+    // 5173 等 51xx 端口可能被本机 VPN/代理（如 AtlasCore）占用导致 EACCES
+    port: 4173,
     strictPort: true,
     host: host || false,
     hmr: host
       ? {
           protocol: "ws",
           host,
-          port: 5174,
+          port: 4174,
         }
       : undefined,
     watch: {

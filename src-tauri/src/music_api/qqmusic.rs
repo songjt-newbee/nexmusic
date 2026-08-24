@@ -1,4 +1,4 @@
-#![allow(dead_code)]
+﻿#![allow(dead_code)]
 
 //! QQ 音乐 API — 完全移植自 Mineradio server.js
 //!
@@ -46,8 +46,8 @@ const QQ_PLAYLIST_SYNC_PAGE_SIZE: u32 = 200;
 const QQ_PLAYLIST_SYNC_MAX_PAGES: usize = 25;
 
 const QQ_VKEY_REQUEST_TIMEOUT_MS: u64 = 6000;
-const QQ_AUDIO_PROBE_TOTAL_MS: u64 = 6200;
-const QQ_AUDIO_PROBE_ATTEMPT_MS: u64 = 2000;
+const QQ_AUDIO_PROBE_TOTAL_MS: u64 = 800;
+const QQ_AUDIO_PROBE_ATTEMPT_MS: u64 = 200;
 const AUDIO_URL_PROBE_BYTES: usize = 8192;
 
 // ============================================================
@@ -983,7 +983,36 @@ pub async fn search(keywords: &str, limit: u32, _cookie: &str) -> Result<Vec<Son
 //  播放地址 (对照 handleQQSongUrl)
 // ============================================================
 
-/// 探测音频 URL (对照 probeQQAudioUrl)
+/// 从 purl 信息构建播放结果（不探测 URL，加快首播）
+fn build_song_url_from_purl(
+    candidate_info: &Value,
+    sip: &str,
+    file_candidates: &[(String, String, String)],
+) -> Option<SongUrlResult> {
+    let purl = candidate_info.get("purl").and_then(|v| v.as_str())?;
+    if purl.is_empty() {
+        return None;
+    }
+    let candidate_url = format!("{}{}", sip, purl);
+    let filename = candidate_info
+        .get("filename")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let file_meta = file_candidates.iter().find(|(f, _, _)| f == filename);
+    let level = file_meta.map(|(_, l, _)| l.clone()).unwrap_or_default();
+    let label = file_meta.map(|(_, _, lb)| lb.clone()).unwrap_or_default();
+    Some(SongUrlResult {
+        url: Some(candidate_url),
+        playable: true,
+        trial: false,
+        level,
+        quality: label,
+        br: 0,
+        ..Default::default()
+    })
+}
+
+/// 快速探测音频 URL（短超时，避免阻塞首播过久）
 async fn probe_audio_url(audio_url: &str, timeout_ms: u64) -> bool {
     if audio_url.is_empty() {
         return false;
@@ -1007,18 +1036,20 @@ async fn probe_audio_url(audio_url: &str, timeout_ms: u64) -> bool {
         return false;
     }
 
-    let content_type = resp.headers()
+    let content_type = resp
+        .headers()
         .get("content-type")
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_lowercase();
-    if content_type.contains("text/html") || content_type.contains("application/json")
-        || content_type.contains("application/xml") || content_type.contains("text/plain")
+    if content_type.contains("text/html")
+        || content_type.contains("application/json")
+        || content_type.contains("application/xml")
+        || content_type.contains("text/plain")
     {
         return false;
     }
 
-    // 读取前 AUDIO_URL_PROBE_BYTES 字节检测魔数
     let body = match resp.bytes().await {
         Ok(b) => b,
         Err(_) => return false,
@@ -1028,14 +1059,11 @@ async fn probe_audio_url(audio_url: &str, timeout_ms: u64) -> bool {
         return false;
     }
 
-    // 检测文件头魔数
-    let _magic = &body[..body.len().min(12)];
     let is_mp3 = body.starts_with(b"ID3");
     let is_flac = body.starts_with(b"fLaC");
     let is_ogg = body.starts_with(b"OggS");
     let is_wav = body.len() >= 12 && &body[0..4] == b"RIFF" && &body[8..12] == b"WAVE";
     let is_mp4 = body.len() >= 8 && &body[4..8] == b"ftyp";
-    // MPEG frame sync
     let is_mpeg = (0..body.len().saturating_sub(1).min(2048))
         .any(|i| body[i] == 0xff && (body[i + 1] & 0xe0) == 0xe0);
 
@@ -1150,71 +1178,40 @@ pub async fn song_url(mid: &str, media_mid: &str, quality: &str, cookie: &str) -
             .collect())
         .unwrap_or_else(|| vec!["https://ws.stream.qqmusic.qq.com/".into()]);
 
-    // 探测音频 URL（快速版），参考 Mineradio 但大幅降低超时时间
-    // 每次探测 800ms，总超时 2s，确保用户点击后快速响应
-    let probe_deadline_ms = 2000u64;
-    let probe_attempt_ms = 800u64;
+    // 快速探测：总预算约 800ms，优先返回首个可播 URL；超时后仍 fallback 到首个 purl
+    let probe_deadline_ms = QQ_AUDIO_PROBE_TOTAL_MS;
+    let probe_attempt_ms = QQ_AUDIO_PROBE_ATTEMPT_MS;
     let start_time = std::time::Instant::now();
+    let mut fallback: Option<SongUrlResult> = None;
 
     for candidate_info in &purl_infos {
         for sip in &sips {
-            if start_time.elapsed().as_millis() as u64 > probe_deadline_ms - 200 {
+            let Some(result) = build_song_url_from_purl(candidate_info, sip, &file_candidates) else {
+                continue;
+            };
+            if fallback.is_none() {
+                fallback = Some(result.clone());
+            }
+            if start_time.elapsed().as_millis() as u64 > probe_deadline_ms {
                 break;
             }
-            let purl = candidate_info.get("purl")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            if purl.is_empty() {
+            let Some(candidate_url) = result.url.as_deref() else {
                 continue;
+            };
+            let remaining_ms =
+                probe_deadline_ms.saturating_sub(start_time.elapsed().as_millis() as u64);
+            let probe_timeout = probe_attempt_ms.min(remaining_ms.max(1));
+            if probe_audio_url(candidate_url, probe_timeout).await {
+                return Ok(result);
             }
-            let candidate_url = format!("{}{}", sip, purl);
-            let remaining_ms = probe_deadline_ms.saturating_sub(start_time.elapsed().as_millis() as u64);
-            let probe_timeout = probe_attempt_ms.min(remaining_ms);
-            if probe_audio_url(&candidate_url, probe_timeout).await {
-                let filename = candidate_info.get("filename")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("");
-                let file_meta = file_candidates.iter()
-                    .find(|(f, _, _)| f == filename);
-                let level = file_meta.map(|(_, l, _)| l.clone()).unwrap_or_default();
-                let label = file_meta.map(|(_, _, lb)| lb.clone()).unwrap_or_default();
-
-                return Ok(SongUrlResult {
-                    url: Some(candidate_url),
-                    playable: true,
-                    trial: false,
-                    level,
-                    quality: label,
-                    br: 0,
-                    ..Default::default()
-                });
-            }
+        }
+        if start_time.elapsed().as_millis() as u64 > probe_deadline_ms {
+            break;
         }
     }
 
-    // 探测全部失败，返回第一个候选 URL（让前端处理失败）
-    // 相比 Mineradio 直接返回不可用，提供一个 URL 让前端有机会重试
-    if let Some(first_info) = purl_infos.first() {
-        if let Some(purl) = first_info.get("purl").and_then(|v| v.as_str()) {
-            if !purl.is_empty() {
-                let sip = sips.first().map(|s| s.as_str()).unwrap_or("https://ws.stream.qqmusic.qq.com/");
-                let fallback_url = format!("{}{}", sip, purl);
-                let filename = first_info.get("filename").and_then(|v| v.as_str()).unwrap_or("");
-                let file_meta = file_candidates.iter().find(|(f, _, _)| f == filename);
-                let level = file_meta.map(|(_, l, _)| l.clone()).unwrap_or_default();
-                let label = file_meta.map(|(_, _, lb)| lb.clone()).unwrap_or_default();
-
-                return Ok(SongUrlResult {
-                    url: Some(fallback_url),
-                    playable: true,
-                    trial: false,
-                    level,
-                    quality: label,
-                    br: 0,
-                    ..Default::default()
-                });
-            }
-        }
+    if let Some(result) = fallback {
+        return Ok(result);
     }
 
     // 无可用 URL
