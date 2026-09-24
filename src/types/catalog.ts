@@ -5,6 +5,7 @@ export type TagSource = "none" | "guess" | "deepseek" | "manual";
 export const LANGUAGES = ["未知", "华语", "英语", "日语", "韩语", "其他"] as const;
 export const COUNTRIES = ["未知", "中国", "美国", "日本", "韩国", "英国", "其他"] as const;
 export const MUSIC_TYPES = ["未知", "歌曲", "纯音乐", "古典"] as const;
+export const ARTIST_GENDERS = ["未知", "男", "女", "组合"] as const;
 export const STYLE_PRESETS = [
   "流行",
   "摇滚",
@@ -45,6 +46,7 @@ export interface CatalogSong {
   language: string;
   artistCountry: string;
   musicType: string;
+  artistGender: string;
   styles: string[];
   tagSource: TagSource;
 }
@@ -75,6 +77,7 @@ export interface AiSongOut {
   language: string;
   artistCountry: string;
   musicType: string;
+  artistGender: string;
   styles: string[];
 }
 
@@ -95,6 +98,7 @@ export function songNeedsTags(song: CatalogSong): boolean {
     isUnknownTag(song.language) ||
     isUnknownTag(song.artistCountry) ||
     isUnknownTag(song.musicType) ||
+    isUnknownTag(song.artistGender) ||
     song.styles.length === 0
   );
 }
@@ -125,6 +129,7 @@ export function songToCatalog(song: Song, provider: MusicProvider): CatalogSong 
     language: "未知",
     artistCountry: "未知",
     musicType: "未知",
+    artistGender: "未知",
     styles: [],
     tagSource: "none",
   };

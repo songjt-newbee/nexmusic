@@ -195,6 +195,113 @@ async fn cache_proxy(Query(query): Query<CacheQuery>, headers: HeaderMap) -> Res
     response
 }
 
+#[derive(Deserialize)]
+struct LocalQuery {
+    path: String,
+}
+
+fn audio_extension_ok(path: &std::path::Path) -> bool {
+    matches!(
+        path.extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .as_deref(),
+        Some("mp3" | "flac" | "wav" | "m4a" | "ogg" | "aac" | "opus")
+    )
+}
+
+/// 本机音频文件。只允许已存在的音频扩展名，供本地导入播放。
+async fn local_proxy(Query(query): Query<LocalQuery>, headers: HeaderMap) -> Response {
+    let raw = query.path.trim();
+    if raw.is_empty() || raw.starts_with("content:") {
+        return (StatusCode::BAD_REQUEST, "Invalid path").into_response();
+    }
+    let path = match std::fs::canonicalize(raw) {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::NOT_FOUND, "File missing").into_response(),
+    };
+    if !path.is_file() || !audio_extension_ok(&path) {
+        return (StatusCode::BAD_REQUEST, "Unsupported file").into_response();
+    }
+
+    let mut file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(e) => {
+            log::warn!("[AudioProxy] local open failed: {e}");
+            return (StatusCode::NOT_FOUND, "File missing").into_response();
+        }
+    };
+    let meta = match file.metadata().await {
+        Ok(m) => m,
+        Err(_) => return (StatusCode::INTERNAL_SERVER_ERROR, "Metadata error").into_response(),
+    };
+    let total = meta.len();
+    if total == 0 {
+        return (StatusCode::OK, "").into_response();
+    }
+    let (start, end) = if let Some(range) = headers.get("range").and_then(|r| r.to_str().ok()) {
+        if let Some(spec) = range.strip_prefix("bytes=") {
+            let parts: Vec<&str> = spec.split('-').collect();
+            if parts.len() == 2 {
+                let s: u64 = parts[0].parse().unwrap_or(0);
+                let e: u64 = if parts[1].is_empty() {
+                    total.saturating_sub(1)
+                } else {
+                    parts[1]
+                        .parse()
+                        .unwrap_or(total.saturating_sub(1))
+                        .min(total.saturating_sub(1))
+                };
+                (s.min(total.saturating_sub(1)), e.max(s.min(total.saturating_sub(1))))
+            } else {
+                (0, total.saturating_sub(1))
+            }
+        } else {
+            (0, total.saturating_sub(1))
+        }
+    } else {
+        (0, total.saturating_sub(1))
+    };
+
+    let mut out_headers = HeaderMap::new();
+    let ct = super::audio_cache::content_type_for_path(&path);
+    out_headers.insert("Content-Type", HeaderValue::from_static(ct));
+    out_headers.insert("Access-Control-Allow-Origin", HeaderValue::from_static("*"));
+    out_headers.insert("Accept-Ranges", HeaderValue::from_static("bytes"));
+    let status = if start > 0 || end + 1 < total {
+        out_headers.insert(
+            "Content-Range",
+            HeaderValue::from_str(&format!("bytes {start}-{end}/{total}"))
+                .unwrap_or(HeaderValue::from_static("")),
+        );
+        out_headers.insert(
+            "Content-Length",
+            HeaderValue::from_str(&(end.saturating_sub(start) + 1).to_string())
+                .unwrap_or(HeaderValue::from_static("0")),
+        );
+        StatusCode::PARTIAL_CONTENT
+    } else {
+        out_headers.insert(
+            "Content-Length",
+            HeaderValue::from_str(&total.to_string()).unwrap_or(HeaderValue::from_static("0")),
+        );
+        StatusCode::OK
+    };
+    if let Err(e) = file.seek(std::io::SeekFrom::Start(start)).await {
+        log::warn!("[AudioProxy] local seek failed: {e}");
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Seek error").into_response();
+    }
+    let limited = file.take(end.saturating_sub(start) + 1);
+    let stream = ReaderStream::new(limited).map(|result| {
+        result.map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
+    });
+    let body = Body::from_stream(stream);
+    let mut response = Response::new(body);
+    *response.status_mut() = status;
+    response.headers_mut().extend(out_headers);
+    response
+}
+
 /// 音频代理 - 支持 Range 请求，纯流式透传（零额外开销）
 async fn audio_proxy(Query(query): Query<ProxyQuery>, headers: HeaderMap) -> Response {
     let audio_url = &query.url;
@@ -317,6 +424,7 @@ pub async fn start_audio_proxy() -> Result<u16, String> {
     let app = Router::new()
         .route("/audio", get(audio_proxy))
         .route("/cache", get(cache_proxy))
+        .route("/local", get(local_proxy))
         .route("/cover", get(cover_proxy));
 
     // 找一个可用端口

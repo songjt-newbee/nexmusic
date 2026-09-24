@@ -6,6 +6,7 @@ import {
   findLikedPlaylist,
   likedSongsForProvider,
   mergeCloudIntoCache,
+  normalizeCatalogSong,
   parseImportedCatalog,
   sleep,
 } from "@/lib/catalog";
@@ -200,7 +201,7 @@ export const useCatalogStore = create<CatalogState>((set, get) => ({
         const cache: CatalogFile = {
           version: 1,
           syncedAt: data?.syncedAt ?? {},
-          songs: Array.isArray(data?.songs) ? data.songs : [],
+          songs: Array.isArray(data?.songs) ? data.songs.map(normalizeCatalogSong) : [],
         };
         set({ cache, loaded: true });
       } else {
@@ -254,7 +255,6 @@ export const useCatalogStore = create<CatalogState>((set, get) => ({
           syncTotal: tot,
           syncMessage: tot ? `已拉取 ${songs.length} / ${tot} 首…` : `已拉取 ${songs.length} 首…`,
         });
-        await persistCache(partial);
       });
       if (cloud.length === 0) {
         throw new Error("没有拉到歌曲，请稍后重试");
@@ -272,6 +272,7 @@ export const useCatalogStore = create<CatalogState>((set, get) => ({
       const msg = typeof e === "string" && e ? e : e instanceof Error ? e.message : "同步中断，可稍后重试";
       const pulled = get().syncCurrent;
       if (pulled > 0) {
+        await persistCache(get().cache);
         toast(`${msg}（已写入 ${pulled} 首，未标取消喜欢）`);
       } else {
         toast(msg);
@@ -357,6 +358,10 @@ export const useCatalogStore = create<CatalogState>((set, get) => ({
           }
           if (isUnknownTag(next.musicType) && item.musicType) {
             next.musicType = item.musicType;
+            changed = true;
+          }
+          if (isUnknownTag(next.artistGender) && item.artistGender) {
+            next.artistGender = item.artistGender;
             changed = true;
           }
           if (next.styles.length === 0 && item.styles?.length) {

@@ -10,9 +10,11 @@ pub mod netease;
 pub mod qqmusic;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
 use tauri::{AppHandle, Emitter, Manager};
+use tokio::sync::Notify;
 use tauri_plugin_store::StoreExt;
 use url::Url;
 use models::*;
@@ -435,6 +437,145 @@ pub async fn qq_login_cookie(app: AppHandle, cookie: String) -> Result<LoginInfo
     qqmusic::login_info(&c).await
 }
 
+/// 尽快把 QQ 登录态交给前端，VIP 探测放到后台，避免界面一直停在登录层
+async fn finish_qq_login(
+    app: &AppHandle,
+    win: Option<&tauri::WebviewWindow>,
+    cookie_str: &str,
+) -> Result<LoginInfo, String> {
+    if !cookie::qq_cookie_has_login(cookie_str) {
+        return Err("还没有读到 QQ 登录 Cookie，请在弹出窗口内完成登录".into());
+    }
+    if !cookie::qq_cookie_has_playback(cookie_str) {
+        return Err(
+            "已登录网页，但还缺少播放授权（qm_keyst）。请把弹出窗口留在 QQ 音乐页面几秒，再点「我已完成登录」"
+                .into(),
+        );
+    }
+    log::info!(
+        "[QQLogin] finishing login, cookie names: {}",
+        cookie_str
+            .split(';')
+            .filter_map(|p| p.split('=').next())
+            .map(|s| s.trim())
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    let _ = cookie::save_cookie(app, "qqmusic", cookie_str);
+    set_provider_cookie("qqmusic", cookie_str.to_string()).await;
+    let uin = cookie::qq_extract_uin(cookie_str);
+    let quick = LoginInfo {
+        provider: "qqmusic".into(),
+        logged_in: true,
+        user_id: uin.clone(),
+        nickname: if uin.is_empty() {
+            "QQ 音乐".into()
+        } else {
+            format!("QQ {uin}")
+        },
+        avatar: if uin.is_empty() {
+            String::new()
+        } else {
+            format!("https://q1.qlogo.cn/g?b=qq&nk={uin}&s=100")
+        },
+        ..Default::default()
+    };
+    let _ = app.emit("qqmusic-login-success", &quick);
+    if let Some(w) = win {
+        let _ = w.close();
+    }
+    #[cfg(mobile)]
+    {
+        let _ = crate::android_cookies::close_login_overlay(app);
+    }
+    let app2 = app.clone();
+    let cookie2 = cookie_str.to_string();
+    tauri::async_runtime::spawn(async move {
+        match qqmusic::login_info(&cookie2).await {
+            Ok(info) if info.logged_in => {
+                let _ = app2.emit("qqmusic-login-success", &info);
+            }
+            Ok(_) => log::warn!("[QQLogin] profile refresh returned logged_in=false"),
+            Err(e) => log::warn!("[QQLogin] profile refresh failed: {e}"),
+        }
+    });
+    Ok(quick)
+}
+
+/// 从仍打开的登录窗口收割 Cookie（用户点「我已完成登录」）
+#[tauri::command]
+pub async fn music_try_complete_login(app: AppHandle, provider: String) -> Result<LoginInfo, String> {
+    #[cfg(not(mobile))]
+    {
+        let label = match provider.as_str() {
+            "kugou" => "kugou-login",
+            "netease" => "netease-login",
+            _ => "qqmusic-login",
+        };
+        let Some(win) = app.get_webview_window(label) else {
+            return match provider.as_str() {
+                "kugou" => kugou::login_info(&load_provider_cookie(&app, "kugou").await).await,
+                "netease" => netease::login_status(&load_app_cookie(&app).await).await,
+                _ => {
+                    let cookie = load_provider_cookie(&app, "qqmusic").await;
+                    if cookie::qq_cookie_has_playback(&cookie) {
+                        qqmusic::login_info(&cookie).await
+                    } else {
+                        Err("登录窗口已关闭，且还没有播放授权，请重新打开官方登录".into())
+                    }
+                }
+            };
+        };
+        let cookies = win.cookies().map_err(|e| e.to_string())?;
+        if provider == "qqmusic" {
+            let mut cookie_str = harvest_qq_webview_cookies(&win);
+            if !cookie::qq_cookie_has_playback(&cookie_str) {
+                if let Ok(home) = Url::parse("https://y.qq.com/n/ryqq/player") {
+                    let _ = win.navigate(home);
+                }
+                let _ = win.eval(QQ_WARMUP_JS);
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                cookie_str = harvest_qq_webview_cookies(&win);
+            }
+            return finish_qq_login(&app, Some(&win), &cookie_str).await;
+        }
+        if provider == "kugou" {
+            let cookie_str = build_cookie_from_webview(&cookies, KUGOU_COOKIE_PRIORITY, is_kugou_domain);
+            if kugou::kugou_cookie_has_login(&cookie_str) {
+                let _ = cookie::save_cookie(&app, "kugou", &cookie_str);
+                set_provider_cookie("kugou", cookie_str).await;
+                let info = kugou::login_info(&get_provider_cookie("kugou").await).await?;
+                if info.logged_in {
+                    let _ = win.close();
+                    let _ = app.emit("kugou-login-success", &info);
+                }
+                return Ok(info);
+            }
+            return Err("还没有读到登录 Cookie，请在弹出窗口内完成登录后再点".into());
+        }
+        let cookie_str = build_cookie_from_webview(&cookies, NETEASE_COOKIE_PRIORITY, is_netease_domain);
+        if cookie::netease_cookie_has_login(&cookie_str) {
+            let _ = cookie::save_cookie(&app, "netease", &cookie_str);
+            set_app_cookie(cookie_str).await;
+            let info = netease::login_status(&get_app_cookie().await).await?;
+            if info.logged_in {
+                let _ = win.close();
+                let _ = app.emit("netease-login-success", &info);
+            }
+            return Ok(info);
+        }
+        Err("还没有读到登录 Cookie，请在弹出窗口内完成登录后再点".into())
+    }
+    #[cfg(mobile)]
+    {
+        let cookie_str = crate::android_cookies::get_cookies(&app, "").unwrap_or_default();
+        if provider == "qqmusic" {
+            return finish_qq_login(&app, None, &cookie_str).await;
+        }
+        qqmusic::login_info(&cookie_str).await
+    }
+}
+
 #[tauri::command]
 pub async fn qq_logout(app: AppHandle) -> Result<(), String> {
     cookie::clear_cookie(&app, "qqmusic")?;
@@ -638,7 +779,11 @@ fn is_kugou_domain(domain: &str) -> bool {
 /// 检查域名是否属于 QQ 音乐 (参考 Mineradio isQQCookieDomain)
 fn is_qq_domain(domain: &str) -> bool {
     let d = domain.trim_start_matches('.').to_lowercase();
-    d == "qq.com" || d.ends_with(".qq.com") || d.ends_with("qqmusic.qq.com")
+    d == "qq.com"
+        || d.ends_with(".qq.com")
+        || d.contains("qq.com")
+        || d.ends_with("qpic.cn")
+        || d.contains("tencent")
 }
 
 /// 从 webview cookies 构建指定平台的 cookie 字符串
@@ -646,14 +791,20 @@ fn build_cookie_from_webview(cookies: &[tauri::webview::Cookie], priority: &[&st
     use std::collections::HashMap;
     let mut picked: HashMap<String, String> = HashMap::new();
     for c in cookies {
-        if let Some(domain) = c.domain() {
-            if domain_check(domain) {
-                let name = c.name().to_string();
-                let value = c.value().to_string();
-                if !name.is_empty() && !value.is_empty() {
-                    picked.insert(name, value);
+        let name = c.name().to_string();
+        let value = c.value().to_string();
+        if name.is_empty() || value.is_empty() {
+            continue;
+        }
+        let domain = c.domain().unwrap_or("");
+        // 无 domain 的 host-only cookie 也要收下，否则 WebView2 登录态会被丢掉
+        if domain.is_empty() || domain_check(domain) || priority.iter().any(|n| *n == name) {
+            if let Some(old) = picked.get(&name) {
+                if value.len() <= old.len() {
+                    continue;
                 }
             }
+            picked.insert(name, value);
         }
     }
     let mut ordered: Vec<(String, String)> = Vec::new();
@@ -672,6 +823,54 @@ fn build_cookie_from_webview(cookies: &[tauri::webview::Cookie], priority: &[&st
         .join("; ")
 }
 
+const QQ_COOKIE_HARVEST_URLS: &[&str] = &[
+    "https://y.qq.com/",
+    "https://y.qq.com/n/ryqq/player",
+    "https://y.qq.com/n/ryqq/profile",
+    "https://y.qq.com/portal/player.html",
+    "https://i.y.qq.com/",
+    "https://u.y.qq.com/",
+    "https://c.y.qq.com/",
+    "https://graph.qq.com/",
+    "https://xui.ptlogin2.qq.com/",
+];
+
+const QQ_WARMUP_PAGES: &[&str] = &[
+    "https://y.qq.com/",
+    "https://y.qq.com/n/ryqq/player",
+    "https://y.qq.com/portal/player.html",
+];
+
+const QQ_WARMUP_JS: &str = r#"
+try {
+  fetch("https://u.y.qq.com/cgi-bin/musicu.fcg", {
+    method: "POST",
+    credentials: "include",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      comm: { ct: 24, cv: 0, format: "json" },
+      req: { module: "userInfo.BaseUserInfoServer", method: "get_user_baseinfo_v2", param: {} }
+    })
+  }).catch(function(){});
+} catch (e) {}
+"#;
+
+#[cfg(not(mobile))]
+fn harvest_qq_webview_cookies(win: &tauri::WebviewWindow) -> String {
+    let mut all: Vec<tauri::webview::Cookie> = Vec::new();
+    if let Ok(c) = win.cookies() {
+        all.extend(c);
+    }
+    for raw in QQ_COOKIE_HARVEST_URLS {
+        if let Ok(url) = raw.parse::<Url>() {
+            if let Ok(c) = win.cookies_for_url(url) {
+                all.extend(c);
+            }
+        }
+    }
+    build_cookie_from_webview(&all, QQ_COOKIE_PRIORITY, is_qq_domain)
+}
+
 /// 打开登录窗口 (多平台) - 使用 Tauri cookies() API 直接读取 HttpOnly cookie
 /// 参考 Mineradio 的 Electron session.cookies.get() 方案
 #[tauri::command]
@@ -688,6 +887,8 @@ pub async fn music_open_login_window(app: AppHandle, provider: String) -> Result
             "music-android-login",
             serde_json::json!({ "provider": provider, "url": url }),
         );
+        crate::android_cookies::open_login_overlay(&app, &url)?;
+        spawn_android_login_poll(app, provider, url);
         return Ok("android_login".into());
     }
     #[cfg(not(mobile))]
@@ -697,6 +898,82 @@ pub async fn music_open_login_window(app: AppHandle, provider: String) -> Result
         "qqmusic" => open_qq_login_window(&app),
         _ => Err(format!("Unknown provider: {}", provider)),
     }
+}
+
+#[cfg(mobile)]
+fn spawn_android_login_poll(app: AppHandle, provider: String, url: String) {
+    tauri::async_runtime::spawn(async move {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        let mut warmup_started = false;
+        for _ in 0..250 {
+            let cookie_str = crate::android_cookies::get_cookies(&app, &url).unwrap_or_default();
+            let ready = match provider.as_str() {
+                "qqmusic" => cookie::qq_cookie_has_playback(&cookie_str),
+                "kugou" => kugou::kugou_cookie_has_playback(&cookie_str),
+                _ => cookie::netease_cookie_has_login(&cookie_str),
+            };
+            let logged = match provider.as_str() {
+                "qqmusic" => cookie::qq_cookie_has_login(&cookie_str),
+                "kugou" => kugou::kugou_cookie_has_login(&cookie_str),
+                _ => cookie::netease_cookie_has_login(&cookie_str),
+            };
+            if ready || (provider == "netease" && logged) {
+                match provider.as_str() {
+                    "qqmusic" => {
+                        let _ = finish_qq_login(&app, None, &cookie_str).await;
+                    }
+                    "kugou" => {
+                        let _ = cookie::save_cookie(&app, "kugou", &cookie_str);
+                        set_provider_cookie("kugou", cookie_str).await;
+                        match kugou::login_info(&get_provider_cookie("kugou").await).await {
+                            Ok(info) if info.logged_in => {
+                                let _ = app.emit("kugou-login-success", &info);
+                            }
+                            Ok(_) => {
+                                let _ = app.emit("kugou-login-failed", "Cookie 无效或已过期");
+                            }
+                            Err(e) => {
+                                let _ = app.emit("kugou-login-failed", &e);
+                            }
+                        }
+                    }
+                    _ => {
+                        let _ = cookie::save_cookie(&app, "netease", &cookie_str);
+                        set_app_cookie(cookie_str).await;
+                        match netease::login_status(&get_app_cookie().await).await {
+                            Ok(info) if info.logged_in => {
+                                let _ = app.emit("netease-login-success", &info);
+                            }
+                            Ok(_) => {
+                                let _ = app.emit("netease-login-failed", "Cookie 无效或已过期");
+                            }
+                            Err(e) => {
+                                let _ = app.emit("netease-login-failed", &e);
+                            }
+                        }
+                    }
+                };
+                let _ = crate::android_cookies::close_login_overlay(&app);
+                return;
+            }
+            if logged && provider == "qqmusic" {
+                let page = if !warmup_started {
+                    warmup_started = true;
+                    QQ_WARMUP_PAGES[0]
+                } else {
+                    QQ_WARMUP_PAGES[1]
+                };
+                let _ = crate::android_cookies::navigate_login_overlay(&app, page);
+            }
+            tokio::time::sleep(Duration::from_millis(1200)).await;
+        }
+        let fail_event = match provider.as_str() {
+            "kugou" => "kugou-login-failed",
+            "netease" => "netease-login-failed",
+            _ => "qqmusic-login-failed",
+        };
+        let _ = app.emit(fail_event, "登录超时，请在 App 内登录页完成后再试");
+    });
 }
 
 /// Windows WebView2：不要给第二扇窗单独设 additional_browser_args（会空白/卡死），
@@ -729,6 +1006,39 @@ fn create_login_window(
         .map_err(|e| format!("Failed to create login window: {e}"))
 }
 
+#[cfg(not(mobile))]
+fn login_window_destroyed(win: &tauri::WebviewWindow) -> bool {
+    win.inner_size().is_err()
+}
+
+#[cfg(not(mobile))]
+fn attach_login_focus_notify(app: &AppHandle, login: &tauri::WebviewWindow) -> Arc<Notify> {
+    let notify = Arc::new(Notify::new());
+    let n = notify.clone();
+    let _ = login.on_window_event(move |e| {
+        if let tauri::WindowEvent::Focused(true) = e {
+            n.notify_one();
+        }
+    });
+    if let Some(main) = app.get_webview_window("main") {
+        let n = notify.clone();
+        let _ = main.on_window_event(move |e| {
+            if let tauri::WindowEvent::Focused(true) = e {
+                n.notify_one();
+            }
+        });
+    }
+    notify
+}
+
+#[cfg(not(mobile))]
+async fn wait_login_poll_tick(notify: &Notify, ms: u64) {
+    tokio::select! {
+        _ = tokio::time::sleep(Duration::from_millis(ms)) => {}
+        _ = notify.notified() => {}
+    }
+}
+
 /// 打开网易云登录窗口
 #[cfg(not(mobile))]
 fn open_netease_login_window(app: &AppHandle) -> Result<String, String> {
@@ -745,10 +1055,15 @@ fn open_netease_login_window(app: &AppHandle) -> Result<String, String> {
 
     let win = login_window.clone();
     let app_handle = app.clone();
+    let notify = attach_login_focus_notify(app, &win);
     tauri::async_runtime::spawn(async move {
         tokio::time::sleep(Duration::from_secs(3)).await;
 
-        for _ in 0..150 {
+        for _ in 0..250 {
+            if login_window_destroyed(&win) {
+                log::info!("[MusicAPI] Login window closed, stop polling");
+                break;
+            }
             match win.cookies() {
                 Ok(cookies) => {
                     let cookie_str = build_cookie_from_webview(&cookies, NETEASE_COOKIE_PRIORITY, is_netease_domain);
@@ -776,16 +1091,12 @@ fn open_netease_login_window(app: &AppHandle) -> Result<String, String> {
                 }
                 Err(e) => {
                     log::warn!("[MusicAPI] Failed to read cookies from webview: {e}");
-                    // 窗口可能已被用户关闭，检测到后停止轮询
-                    if !win.is_visible().unwrap_or(false) {
-                        log::info!("[MusicAPI] Login window closed, stop polling");
-                        break;
-                    }
                 }
             }
-            tokio::time::sleep(Duration::from_secs(2)).await;
+            wait_login_poll_tick(&notify, 2000).await;
         }
-        log::warn!("[MusicAPI] Login window polling timed out after 5 minutes");
+        log::warn!("[MusicAPI] Login window polling timed out");
+        let _ = app_handle.emit("netease-login-failed", "登录超时，请在 App 弹出的登录窗口内完成");
     });
 
     Ok("window_created".into())
@@ -810,19 +1121,22 @@ fn open_kugou_login_window(app: &AppHandle) -> Result<String, String> {
 
     let win = login_window.clone();
     let app_handle = app.clone();
+    let notify = attach_login_focus_notify(app, &win);
     tauri::async_runtime::spawn(async move {
-        // 等待页面加载
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         let mut warmup_started = false;
 
-        for _ in 0..150 {
+        for _ in 0..250 {
+            if login_window_destroyed(&win) {
+                log::info!("[KugouLogin] Login window closed, stop polling");
+                break;
+            }
             match win.cookies() {
                 Ok(cookies) => {
                     let cookie_str = build_cookie_from_webview(&cookies, KUGOU_COOKIE_PRIORITY, is_kugou_domain);
 
                     if kugou::kugou_cookie_has_playback(&cookie_str) {
-                        // 登录完成 (playbackReady: userid + token)
                         log::info!("[KugouLogin] playbackReady cookie found, length: {}", cookie_str.len());
                         let _ = cookie::save_cookie(&app_handle, "kugou", &cookie_str);
                         set_provider_cookie("kugou", cookie_str).await;
@@ -842,8 +1156,6 @@ fn open_kugou_login_window(app: &AppHandle) -> Result<String, String> {
                         }
                         return;
                     } else if kugou::kugou_cookie_has_login(&cookie_str) && !warmup_started {
-                        // 有登录态但 token 不完整 → warmup
-                        // 参考 Mineradio: 导航到 warmup URL 触发更多 cookie 写入
                         warmup_started = true;
                         log::info!("[KugouLogin] loggedIn but not playbackReady, starting warmup...");
                         if let Ok(warmup) = warmup_url.parse::<Url>() {
@@ -853,31 +1165,28 @@ fn open_kugou_login_window(app: &AppHandle) -> Result<String, String> {
                 }
                 Err(e) => {
                     log::warn!("[KugouLogin] Failed to read cookies from webview: {e}");
-                    // 窗口可能已被用户关闭，检测到后停止轮询
-                    if !win.is_visible().unwrap_or(false) {
-                        log::info!("[KugouLogin] Login window closed, stop polling");
-                        break;
-                    }
                 }
             }
-            tokio::time::sleep(Duration::from_millis(1200)).await;
+            wait_login_poll_tick(&notify, 1200).await;
         }
 
-        // 超时 — 最后检查一次 cookie
-        if let Ok(cookies) = win.cookies() {
-            let cookie_str = build_cookie_from_webview(&cookies, KUGOU_COOKIE_PRIORITY, is_kugou_domain);
-            if kugou::kugou_cookie_has_login(&cookie_str) {
-                log::info!("[KugouLogin] Timeout but found partial login, saving cookie");
-                let _ = cookie::save_cookie(&app_handle, "kugou", &cookie_str);
-                set_provider_cookie("kugou", cookie_str).await;
-                let kugou_cookie = get_provider_cookie("kugou").await;
-                if let Ok(info) = kugou::login_info(&kugou_cookie).await {
-                    let _ = app_handle.emit("kugou-login-success", &info);
+        if !login_window_destroyed(&win) {
+            if let Ok(cookies) = win.cookies() {
+                let cookie_str = build_cookie_from_webview(&cookies, KUGOU_COOKIE_PRIORITY, is_kugou_domain);
+                if kugou::kugou_cookie_has_login(&cookie_str) {
+                    log::info!("[KugouLogin] Timeout but found partial login, saving cookie");
+                    let _ = cookie::save_cookie(&app_handle, "kugou", &cookie_str);
+                    set_provider_cookie("kugou", cookie_str).await;
+                    let kugou_cookie = get_provider_cookie("kugou").await;
+                    if let Ok(info) = kugou::login_info(&kugou_cookie).await {
+                        let _ = app_handle.emit("kugou-login-success", &info);
+                    }
+                    return;
                 }
-                return;
             }
         }
-        log::warn!("[KugouLogin] Polling timed out after 5 minutes");
+        log::warn!("[KugouLogin] Polling timed out");
+        let _ = app_handle.emit("kugou-login-failed", "登录超时，请在 App 弹出的登录窗口内完成");
     });
 
     Ok("window_created".into())
@@ -888,7 +1197,6 @@ fn open_kugou_login_window(app: &AppHandle) -> Result<String, String> {
 /// 需要导航到 warmup URL 触发更多 cookie 写入
 #[cfg(not(mobile))]
 fn open_qq_login_window(app: &AppHandle) -> Result<String, String> {
-    let warmup_url = "https://y.qq.com/n/ryqq/player";
     let login_window = create_login_window(
         app,
         "qqmusic-login",
@@ -902,71 +1210,72 @@ fn open_qq_login_window(app: &AppHandle) -> Result<String, String> {
 
     let win = login_window.clone();
     let app_handle = app.clone();
+    let notify = attach_login_focus_notify(app, &win);
     tauri::async_runtime::spawn(async move {
-        // 等待页面加载
         tokio::time::sleep(Duration::from_secs(3)).await;
 
         let mut warmup_started = false;
+        let mut warmup_ticks: u32 = 0;
+        let mut last_cookie = String::new();
 
-        for _ in 0..150 {
-            match win.cookies() {
-                Ok(cookies) => {
-                    let cookie_str = build_cookie_from_webview(&cookies, QQ_COOKIE_PRIORITY, is_qq_domain);
+        for _ in 0..250 {
+            if login_window_destroyed(&win) {
+                log::info!("[QQLogin] Login window closed, last harvest");
+                break;
+            }
+            let cookie_str = harvest_qq_webview_cookies(&win);
+            if !cookie_str.is_empty() {
+                last_cookie = cookie_str.clone();
+            }
+            let names: Vec<&str> = cookie_str
+                .split(';')
+                .filter_map(|p| p.split('=').next())
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .collect();
+            if !names.is_empty() {
+                log::info!("[QQLogin] cookie keys: {}", names.join(","));
+            }
 
-                    if cookie::qq_cookie_has_playback(&cookie_str) {
-                        log::info!("[QQLogin] playbackReady cookie found, length: {}", cookie_str.len());
-                        let _ = cookie::save_cookie(&app_handle, "qqmusic", &cookie_str);
-                        set_provider_cookie("qqmusic", cookie_str).await;
-                        let _ = win.close();
-                        let qq_cookie = get_provider_cookie("qqmusic").await;
-                        match qqmusic::login_info(&qq_cookie).await {
-                            Ok(info) => {
-                                if info.logged_in {
-                                    let _ = app_handle.emit("qqmusic-login-success", &info);
-                                } else {
-                                    let _ = app_handle.emit("qqmusic-login-failed", "Cookie 无效或已过期");
-                                }
-                            }
-                            Err(e) => {
-                                let _ = app_handle.emit("qqmusic-login-failed", &e);
-                            }
-                        }
-                        return;
-                    } else if cookie::qq_cookie_has_login(&cookie_str) && !warmup_started {
-                        warmup_started = true;
-                        log::info!("[QQLogin] loggedIn but not playbackReady, starting warmup...");
-                        if let Ok(warmup) = warmup_url.parse::<Url>() {
-                            let _ = win.navigate(warmup);
-                        }
-                    }
+            if cookie::qq_cookie_has_playback(&cookie_str) {
+                match finish_qq_login(&app_handle, Some(&win), &cookie_str).await {
+                    Ok(_) => return,
+                    Err(e) => log::warn!("[QQLogin] finish failed: {e}"),
                 }
-                Err(e) => {
-                    log::warn!("[QQLogin] Failed to read cookies from webview: {e}");
-                    // 窗口可能已被用户关闭，检测到后停止轮询
-                    if !win.is_visible().unwrap_or(false) {
-                        log::info!("[QQLogin] Login window closed, stop polling");
-                        break;
+            } else if cookie::qq_cookie_has_login(&cookie_str) {
+                warmup_ticks = warmup_ticks.saturating_add(1);
+                if !warmup_started {
+                    warmup_started = true;
+                    log::info!("[QQLogin] web login ok, waiting for playback cookie qm_keyst");
+                }
+                let page = QQ_WARMUP_PAGES[(warmup_ticks as usize / 3) % QQ_WARMUP_PAGES.len()];
+                if warmup_ticks == 1 || warmup_ticks % 3 == 0 {
+                    if let Ok(warmup) = page.parse::<Url>() {
+                        let _ = win.navigate(warmup);
                     }
+                    let _ = win.eval(QQ_WARMUP_JS);
                 }
             }
-            tokio::time::sleep(Duration::from_millis(1200)).await;
+
+            wait_login_poll_tick(&notify, 1000).await;
         }
 
-        // 超时 — 最后检查一次 cookie
-        if let Ok(cookies) = win.cookies() {
-            let cookie_str = build_cookie_from_webview(&cookies, QQ_COOKIE_PRIORITY, is_qq_domain);
-            if cookie::qq_cookie_has_login(&cookie_str) {
-                log::info!("[QQLogin] Timeout but found partial login, saving cookie");
-                let _ = cookie::save_cookie(&app_handle, "qqmusic", &cookie_str);
-                set_provider_cookie("qqmusic", cookie_str).await;
-                let qq_cookie = get_provider_cookie("qqmusic").await;
-                if let Ok(info) = qqmusic::login_info(&qq_cookie).await {
-                    let _ = app_handle.emit("qqmusic-login-success", &info);
-                }
-                return;
-            }
+        if cookie::qq_cookie_has_playback(&last_cookie) {
+            let _ = finish_qq_login(
+                &app_handle,
+                app_handle.get_webview_window("qqmusic-login").as_ref(),
+                &last_cookie,
+            )
+            .await;
+            return;
         }
-        log::warn!("[QQLogin] Polling timed out after 5 minutes");
+        log::warn!("[QQLogin] Polling timed out, playback cookie missing");
+        let msg = if cookie::qq_cookie_has_login(&last_cookie) {
+            "已登录网页，但还缺少播放授权。请把弹出窗口留在 QQ 音乐播放页，再点「我已完成登录」"
+        } else {
+            "还没读到登录信息。请在弹出的 QQ 窗口内完成登录后，回到本窗口点「我已完成登录」"
+        };
+        let _ = app_handle.emit("qqmusic-login-failed", msg);
     });
 
     Ok("window_created".into())

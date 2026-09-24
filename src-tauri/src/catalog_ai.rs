@@ -24,6 +24,8 @@ pub struct AiSongOut {
     pub artist_country: String,
     pub music_type: String,
     #[serde(default)]
+    pub artist_gender: String,
+    #[serde(default)]
     pub styles: Vec<String>,
 }
 
@@ -54,6 +56,7 @@ pub async fn catalog_ai_tag(app: AppHandle, songs: Vec<AiSongIn>) -> Result<Vec<
 key(原样回传), language(华语/英语/日语/韩语/其他), \
 artistCountry(中国/美国/日本/韩国/英国/其他), \
 musicType(歌曲/纯音乐/古典), \
+artistGender(男/女/组合/未知，看不准就用未知), \
 styles(1到3个，取值：流行,摇滚,民谣,电子,爵士,轻音乐,古风,说唱,R&B,影视,动漫,古典)。\
 不确定就用最接近的值，不要输出 markdown。";
 
@@ -166,6 +169,8 @@ fn parse_ai_items(content: &str) -> Result<Vec<AiSongOut>, String> {
             artist_country: str_field(&item, &["artistCountry", "artist_country", "country"])
                 .unwrap_or_else(|| "未知".into()),
             music_type: str_field(&item, &["musicType", "music_type", "type"]).unwrap_or_else(|| "未知".into()),
+            artist_gender: str_field(&item, &["artistGender", "artist_gender", "gender"])
+                .unwrap_or_else(|| "未知".into()),
             styles,
         });
     }
@@ -182,6 +187,64 @@ fn str_field(item: &Value, keys: &[&str]) -> Option<String> {
         }
     }
     None
+}
+
+#[tauri::command]
+pub async fn catalog_translate_lyric(app: AppHandle, lines: Vec<String>) -> Result<Vec<String>, String> {
+    if lines.is_empty() {
+        return Ok(vec![]);
+    }
+    if lines.len() > 120 {
+        return Err("歌词太长".into());
+    }
+    let api_key = load_deepseek_key(&app)?;
+    let system = "你是歌词翻译。把每一行歌词翻译成简体中文。\
+必须返回 JSON：{\"lines\":[...]}。lines 长度必须和输入相同，顺序一致。\
+空字符串仍回空字符串。不要加序号、时间轴或解释。";
+    let user = format!(
+        "请翻译这些歌词行：{}",
+        serde_json::to_string(&lines).unwrap_or_else(|_| "[]".into())
+    );
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(60))
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败: {e}"))?;
+    let (status, text) = post_deepseek(&client, &api_key, &system, &user, true).await?;
+    let (status, text) = if status.as_u16() == 400 {
+        post_deepseek(&client, &api_key, &system, &user, false).await?
+    } else {
+        (status, text)
+    };
+    if !status.is_success() {
+        if status.as_u16() == 401 {
+            return Err("DeepSeek Key 无效".into());
+        }
+        if status.as_u16() == 402 || text.contains("Insufficient Balance") {
+            return Err("DeepSeek 余额不足".into());
+        }
+        return Err(format!("DeepSeek 返回 HTTP {}", status.as_u16()));
+    }
+    let envelope: Value = serde_json::from_str(&text).map_err(|_| "DeepSeek 响应不是 JSON".to_string())?;
+    let content = envelope
+        .pointer("/choices/0/message/content")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim();
+    if content.is_empty() {
+        return Err("DeepSeek 没有返回内容".into());
+    }
+    let parsed: Value = serde_json::from_str(&extract_json(content)).map_err(|_| "无法解析译文 JSON".to_string())?;
+    let arr = parsed
+        .get("lines")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| "译文缺少 lines".to_string())?;
+    if arr.len() != lines.len() {
+        return Err("译文行数和原文不一致".into());
+    }
+    Ok(arr
+        .iter()
+        .map(|v| v.as_str().unwrap_or("").trim().to_string())
+        .collect())
 }
 
 fn extract_json(content: &str) -> String {

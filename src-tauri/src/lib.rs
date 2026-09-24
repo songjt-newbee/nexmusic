@@ -1,4 +1,5 @@
 mod android_cookies;
+mod local_audio;
 mod catalog;
 mod catalog_ai;
 mod mediasession;
@@ -8,6 +9,7 @@ mod music_api;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_store::Builder::default().build())
         .plugin(
             tauri_plugin_log::Builder::default()
@@ -15,6 +17,7 @@ pub fn run() {
                 .build(),
         )
         .plugin(mediasession::init())
+        .plugin(android_cookies::init())
         .setup(|app| {
             let handle = app.handle().clone();
             music_api::audio_proxy::set_app_handle(handle.clone());
@@ -29,6 +32,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             android_cookies::android_get_cookies,
+            android_cookies::android_close_login,
+            android_cookies::android_handle_back,
+            android_cookies::android_leave_app,
             mediasession::media_session_update,
             mediasession::media_session_stop,
             music_api::music_search,
@@ -85,6 +91,7 @@ pub fn run() {
             music_api::qq_lyric,
             music_api::qq_login_status,
             music_api::qq_login_cookie,
+            music_api::music_try_complete_login,
             music_api::qq_logout,
             music_api::qq_user_playlists,
             music_api::qq_playlist_tracks,
@@ -101,6 +108,7 @@ pub fn run() {
             music_api::music_switch_provider,
             music_api::music_get_playback_source,
             music_api::audio_proxy::cmd_get_proxy_port,
+            local_audio::prepare_local_audio,
             music_api::audio_cache::audio_cache_lookup,
             music_api::audio_cache::audio_cache_download,
             catalog::catalog_load,
@@ -108,6 +116,7 @@ pub fn run() {
             catalog::catalog_has_deepseek_key,
             catalog::catalog_set_deepseek_key,
             catalog_ai::catalog_ai_tag,
+            catalog_ai::catalog_translate_lyric,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

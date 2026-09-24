@@ -216,6 +216,10 @@ pub fn content_type_for_path(path: &Path) -> &'static str {
         "audio/ogg"
     } else if name.ends_with(".wav") {
         "audio/wav"
+    } else if name.ends_with(".aac") {
+        "audio/aac"
+    } else if name.ends_with(".opus") {
+        "audio/ogg"
     } else {
         "audio/mpeg"
     }

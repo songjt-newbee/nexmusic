@@ -86,7 +86,9 @@ class PlaybackService : Service() {
                 .build(),
         )
 
-        val launch = packageManager.getLaunchIntentForPackage(packageName)
+        val launch = packageManager.getLaunchIntentForPackage(packageName)?.apply {
+            addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT or Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
         val contentPi = PendingIntent.getActivity(
             this,
             0,

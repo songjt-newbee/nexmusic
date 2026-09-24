@@ -1,9 +1,12 @@
-import { useMemo, useRef, useState, type ReactNode } from "react";
-import { Download, ListPlus, Pencil, Plus, RefreshCw, Upload } from "lucide-react";
+import { useEffect, useMemo, useState, type ReactNode } from "react";
+import { ListPlus, ListStart, Pencil, Plus, RefreshCw } from "lucide-react";
 import { coverProxyUrl, useMusicStore } from "@/stores/music-store";
+import { useScrollParent, VirtualRows } from "@/virtual-list";
 import { formatSyncedAt, useCatalogStore } from "@/stores/catalog-store";
 import { filterCatalog } from "@/lib/catalog";
+import { matchesListQuery } from "@/lib/list-query";
 import {
+  ARTIST_GENDERS,
   COUNTRIES,
   LANGUAGES,
   MUSIC_TYPES,
@@ -62,6 +65,7 @@ function TagEditor({ song, onClose }: { song: CatalogSong; onClose: () => void }
   const [language, setLanguage] = useState(song.language || "未知");
   const [artistCountry, setArtistCountry] = useState(song.artistCountry || "未知");
   const [musicType, setMusicType] = useState(song.musicType || "未知");
+  const [artistGender, setArtistGender] = useState(song.artistGender || "未知");
   const [styles, setStyles] = useState<string[]>(song.styles || []);
 
   return (
@@ -87,6 +91,12 @@ function TagEditor({ song, onClose }: { song: CatalogSong; onClose: () => void }
             <option key={v}>{v}</option>
           ))}
         </select>
+        <label className="field-label">歌手性别</label>
+        <select value={artistGender} onChange={(e) => setArtistGender(e.target.value)}>
+          {ARTIST_GENDERS.map((v) => (
+            <option key={v}>{v}</option>
+          ))}
+        </select>
         <label className="field-label">风格</label>
         <div className="chip-row">
           {STYLE_PRESETS.map((st) => (
@@ -104,7 +114,9 @@ function TagEditor({ song, onClose }: { song: CatalogSong; onClose: () => void }
         <button
           className="primary"
           style={{ width: "100%", marginTop: 14 }}
-          onClick={() => void updateSongTags(song.key, { language, artistCountry, musicType, styles })}
+          onClick={() =>
+            void updateSongTags(song.key, { language, artistCountry, musicType, artistGender, styles })
+          }
         >
           保存标签
         </button>
@@ -114,8 +126,11 @@ function TagEditor({ song, onClose }: { song: CatalogSong; onClose: () => void }
 }
 
 export function ClassifyTab() {
+  const scrollElement = useScrollParent();
+  const [filtersOpen, setFiltersOpen] = useState(true);
   const playbackSource = useMusicStore((s) => s.playbackSource);
   const playSong = useMusicStore((s) => s.playSong);
+  const playNext = useMusicStore((s) => s.playNext);
   const addToQueue = useMusicStore((s) => s.addToQueue);
   const addListToQueue = useMusicStore((s) => s.addListToQueue);
   const proxyPort = useMusicStore((s) => s.proxyPort);
@@ -124,21 +139,31 @@ export function ClassifyTab() {
   const setFilters = useCatalogStore((s) => s.setFilters);
   const editingKey = useCatalogStore((s) => s.editingKey);
   const setEditingKey = useCatalogStore((s) => s.setEditingKey);
-  const exportJson = useCatalogStore((s) => s.exportJson);
-  const importJson = useCatalogStore((s) => s.importJson);
   const guessTags = useCatalogStore((s) => s.guessTags);
   const deepseekTag = useCatalogStore((s) => s.deepseekTag);
-  const saveDeepseekKey = useCatalogStore((s) => s.saveDeepseekKey);
-  const hasDeepseekKey = useCatalogStore((s) => s.hasDeepseekKey);
   const tagging = useCatalogStore((s) => s.tagging);
   const tagCurrent = useCatalogStore((s) => s.tagCurrent);
   const tagTotal = useCatalogStore((s) => s.tagTotal);
-  const fileRef = useRef<HTMLInputElement>(null);
-  const [keyDraft, setKeyDraft] = useState("");
 
   const songs = useMemo(() => filterCatalog(cache.songs, filters), [cache.songs, filters]);
-  const playable = useMemo(() => songs.map(catalogToSong), [songs]);
+  const [query, setQuery] = useState("");
+  const shown = useMemo(
+    () => songs.filter((song) => matchesListQuery(catalogToSong(song), query, song)),
+    [songs, query],
+  );
+  const playable = useMemo(() => shown.map(catalogToSong), [shown]);
   const editing = cache.songs.find((s) => s.key === editingKey) ?? null;
+
+  useEffect(() => {
+    let last = scrollElement.scrollTop;
+    const onScroll = () => {
+      const y = scrollElement.scrollTop;
+      if (y > 80 && y > last) setFiltersOpen(false);
+      last = y;
+    };
+    scrollElement.addEventListener("scroll", onScroll, { passive: true });
+    return () => scrollElement.removeEventListener("scroll", onScroll);
+  }, [scrollElement]);
 
   const toggleStyle = (st: string) => {
     const next = filters.styles.includes(st)
@@ -151,12 +176,6 @@ export function ClassifyTab() {
     <>
       <LikedSyncBar />
       <div className="catalog-actions">
-        <button className="ghost" onClick={() => exportJson()}>
-          <Download size={14} /> 导出
-        </button>
-        <button className="ghost" onClick={() => fileRef.current?.click()}>
-          <Upload size={14} /> 导入
-        </button>
         <button className="ghost" onClick={() => void guessTags()}>
           规则猜测
         </button>
@@ -164,31 +183,24 @@ export function ClassifyTab() {
           {tagging ? `AI ${tagCurrent}/${tagTotal}` : "AI 标注"}
         </button>
       </div>
-      <input
-        ref={fileRef}
-        type="file"
-        accept="application/json"
-        hidden
-        onChange={(e) => {
-          const file = e.target.files?.[0];
-          e.target.value = "";
-          if (!file) return;
-          void file.text().then((text) => importJson(text));
-        }}
-      />
-      <div className="key-row">
-        <input
-          type="password"
-          placeholder={hasDeepseekKey ? "已保存 DeepSeek Key，可覆盖" : "DeepSeek API Key"}
-          value={keyDraft}
-          onChange={(e) => setKeyDraft(e.target.value)}
-        />
-        <button className="ghost" onClick={() => void saveDeepseekKey(keyDraft).then(() => setKeyDraft(""))}>
-          保存
+
+      <div className="section-title">
+        筛选（同时满足）
+        <button
+          className="ghost"
+          style={{ marginLeft: "auto" }}
+          onClick={() => {
+            setFiltersOpen((open) => {
+              if (!open) scrollElement.scrollTop = 0;
+              return !open;
+            });
+          }}
+        >
+          {filtersOpen ? "收起" : "展开"}
         </button>
       </div>
-
-      <div className="section-title">筛选（同时满足）</div>
+      {filtersOpen ? (
+      <>
       <div className="chip-row">
         <Chip active={filters.language === "全部"} onClick={() => setFilters({ language: "全部" })}>
           语言·全部
@@ -234,9 +246,11 @@ export function ClassifyTab() {
         />
         隐藏已取消喜欢
       </label>
+      </>
+      ) : null}
 
       <div className="section-title">
-        {songs.length} 首
+        {query.trim() ? shown.length : songs.length} 首
         {playable.length > 0 ? (
           <button
             className="icon-btn"
@@ -247,53 +261,79 @@ export function ClassifyTab() {
           </button>
         ) : null}
       </div>
+      <input
+        className="list-search"
+        value={query}
+        placeholder="搜索歌名、歌手、专辑或分类"
+        onChange={(e) => setQuery(e.target.value)}
+      />
       {songs.length === 0 ? (
         <p className="empty">还没有可筛选的歌曲，请先登录并同步我喜欢</p>
+      ) : shown.length === 0 ? (
+        <p className="empty">没有匹配的歌曲</p>
       ) : (
-        songs.map((song) => {
-          const item = catalogToSong(song);
-          return (
-            <div key={song.key} className="song-row">
-              <img
-                className="cover"
-                src={coverProxyUrl(song.cover, proxyPort)}
-                alt=""
-                onClick={() => void playSong(item)}
-              />
-              <div className="meta" onClick={() => void playSong(item)}>
-                <b>{song.name}</b>
-                <span>{song.artist}</span>
-                <span className="tag-line">
-                  {[song.language, song.artistCountry, song.musicType, ...song.styles]
-                    .filter((v) => v && v !== "未知")
-                    .join(" · ") || "未分类"}
-                  {song.sources[0] === playbackSource ? "" : ` · ${song.sources[0]}`}
-                  {song.inLiked ? "" : " · 已不在喜欢"}
-                </span>
+        <VirtualRows
+          count={shown.length}
+          scrollElement={scrollElement}
+          estimateSize={96}
+          renderRow={(i) => {
+            const song = shown[i];
+            const item = catalogToSong(song);
+            return (
+              <div className="song-row">
+                <img
+                  className="cover"
+                  src={coverProxyUrl(song.cover, proxyPort)}
+                  alt=""
+                  loading="lazy"
+                  decoding="async"
+                  onClick={() => void playSong(item)}
+                />
+                <div className="meta" onClick={() => void playSong(item)}>
+                  <b>{song.name}</b>
+                  <span>{song.artist}</span>
+                  <span className="tag-line">
+                    {[song.language, song.artistCountry, song.artistGender, song.musicType, ...song.styles]
+                      .filter((v) => v && v !== "未知")
+                      .join(" · ") || "未分类"}
+                    {song.sources[0] === playbackSource ? "" : ` · ${song.sources[0]}`}
+                    {song.inLiked ? "" : " · 已不在喜欢"}
+                  </span>
+                </div>
+                <button
+                  className="icon-btn"
+                  title="下一首播放"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    playNext(item);
+                  }}
+                >
+                  <ListStart size={16} />
+                </button>
+                <button
+                  className="icon-btn"
+                  title="加入播放列表"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    addToQueue([item]);
+                  }}
+                >
+                  <Plus size={16} />
+                </button>
+                <button
+                  className="icon-btn"
+                  title="改标签"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    setEditingKey(song.key);
+                  }}
+                >
+                  <Pencil size={16} />
+                </button>
               </div>
-              <button
-                className="icon-btn"
-                title="加入播放列表"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  addToQueue([item]);
-                }}
-              >
-                <Plus size={16} />
-              </button>
-              <button
-                className="icon-btn"
-                title="改标签"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  setEditingKey(song.key);
-                }}
-              >
-                <Pencil size={16} />
-              </button>
-            </div>
-          );
-        })
+            );
+          }}
+        />
       )}
       {editing ? <TagEditor song={editing} onClose={() => setEditingKey(null)} /> : null}
     </>

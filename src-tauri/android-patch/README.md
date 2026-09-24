@@ -16,4 +16,4 @@ powershell -File scripts/patch-android.ps1
 
 `tauri android init` 若再次执行会覆盖 `gen/android`，请重新跑补丁脚本（幂等）。
 
-第一期 Android 登录仍可用「粘贴 Cookie」。通知栏播放条在首次播放时会向系统申请通知权限。
+登录使用 **系统 WebView 盖层**（不打包 Chromium）。通知栏播放条在首次播放时会向系统申请通知权限。

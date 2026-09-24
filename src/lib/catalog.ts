@@ -172,6 +172,17 @@ export function parseImportedCatalog(raw: unknown): CatalogFile {
   return {
     version: 1,
     syncedAt,
-    songs: songs as CatalogSong[],
+    songs: (songs as CatalogSong[]).map(normalizeCatalogSong),
+  };
+}
+
+export function normalizeCatalogSong(song: CatalogSong): CatalogSong {
+  return {
+    ...song,
+    language: song.language || "未知",
+    artistCountry: song.artistCountry || "未知",
+    musicType: song.musicType || "未知",
+    artistGender: song.artistGender || "未知",
+    styles: Array.isArray(song.styles) ? song.styles : [],
   };
 }

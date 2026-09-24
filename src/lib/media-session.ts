@@ -20,6 +20,14 @@ export function bindMediaSessionControls(handlers: {
   }).catch(() => {
     bound = false;
   });
+
+  if (typeof navigator !== "undefined" && "mediaSession" in navigator) {
+    const ms = navigator.mediaSession;
+    ms.setActionHandler("play", () => handlers.play());
+    ms.setActionHandler("pause", () => handlers.pause());
+    ms.setActionHandler("previoustrack", () => handlers.prev());
+    ms.setActionHandler("nexttrack", () => handlers.next());
+  }
 }
 
 export function syncMediaSession(opts: {
@@ -39,6 +47,15 @@ export function syncMediaSession(opts: {
     durationMs: Math.max(0, Math.round(opts.durationMs)),
     positionMs: Math.max(0, Math.round(opts.positionMs)),
   }).catch(() => {});
+
+  if (typeof navigator !== "undefined" && "mediaSession" in navigator) {
+    navigator.mediaSession.metadata = new MediaMetadata({
+      title: opts.title,
+      artist: opts.artist,
+      artwork: opts.cover ? [{ src: opts.cover, sizes: "512x512", type: "image/jpeg" }] : [],
+    });
+    navigator.mediaSession.playbackState = opts.playing ? "playing" : "paused";
+  }
 }
 
 export function stopMediaSession() {

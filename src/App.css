@@ -99,9 +99,10 @@ input {
 
 .scroll {
   flex: 1;
+  min-height: 0;
   overflow-y: scroll;
   overflow-x: hidden;
-  padding: 8px 8px 120px 16px;
+  padding: 8px 8px 16px 16px;
   scrollbar-width: auto;
   scrollbar-color: var(--accent) #2a2a2a;
 }
@@ -307,18 +308,26 @@ input {
 }
 
 .mini {
-  position: absolute;
-  left: 12px;
-  right: 12px;
-  bottom: 64px;
-  background: #2a2a2aee;
-  backdrop-filter: blur(16px);
+  position: relative;
+  z-index: 5;
+  flex-shrink: 0;
+  margin: 0 12px 8px;
+  background: #2a2a2a;
   border-radius: 14px;
   display: flex;
   align-items: center;
   gap: 8px;
   padding: 8px;
   cursor: pointer;
+}
+
+.mini-empty {
+  cursor: default;
+  opacity: 0.95;
+}
+
+.mini-cover-empty {
+  background: #333;
 }
 
 .mini .cover {
@@ -351,6 +360,7 @@ input {
   color: var(--muted);
   padding: 8px 0;
   cursor: pointer;
+  font-size: 11px;
 }
 
 .tabs button.active {
@@ -371,6 +381,62 @@ input {
   background: #0a0a0a;
 }
 
+.boot-splash {
+  position: absolute;
+  inset: 0;
+  z-index: 80;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  background: radial-gradient(120% 80% at 50% -10%, #1f2a24 0%, #111111 42%);
+}
+
+.boot-logo {
+  font-size: 28px;
+  font-weight: 700;
+  color: var(--accent);
+  letter-spacing: 0.04em;
+}
+
+.now-playing-stage {
+  flex: 1;
+  min-height: 0;
+  position: relative;
+  background-size: cover;
+  background-position: center;
+  background-color: #151515;
+  overflow: auto;
+}
+
+.now-playing-stage::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.72);
+}
+
+.now-playing-cover-wrap {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+}
+
+.lyric-hint {
+  color: var(--muted);
+  font-size: 12px;
+  margin-top: 8px;
+}
+
+.now-cover-empty {
+  background: #222;
+}
+
 .now-playing-lyrics {
   flex: 1;
   min-height: 0;
@@ -384,9 +450,7 @@ input {
   content: "";
   position: absolute;
   inset: 0;
-  background: rgba(0, 0, 0, 0.55);
-  backdrop-filter: blur(28px);
-  -webkit-backdrop-filter: blur(28px);
+  background: rgba(0, 0, 0, 0.72);
 }
 
 .now-playing-lyrics-inner {
@@ -398,7 +462,7 @@ input {
 
 .now-playing-controls {
   flex-shrink: 0;
-  padding: 16px 20px 20px;
+  padding: 16px 12px 20px;
   background: linear-gradient(to top, #111 85%, transparent);
   border-top: 1px solid #ffffff10;
 }
@@ -437,18 +501,77 @@ input {
   opacity: 0.85;
 }
 
+.now-playing > .topbar {
+  position: relative;
+  z-index: 4;
+}
+
 .overlay .topbar .brand {
   flex: 1;
 }
 
 .list-actions {
   display: flex;
-  justify-content: flex-end;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   margin: 0 0 4px;
+}
+
+.list-search {
+  width: 100%;
+  box-sizing: border-box;
+  border: 0;
+  background: var(--bg-card);
+  border-radius: 12px;
+  padding: 10px 14px;
+  margin: 0 0 8px;
+  outline: none;
+  color: inherit;
 }
 
 .queue-sheet {
   z-index: 35;
+}
+
+.detail-sheet {
+  z-index: 40;
+}
+
+.detail-entry {
+  margin-top: 8px;
+}
+
+.detail-fields {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+}
+
+.detail-field,
+.detail-static {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  margin: 0;
+  padding: 10px 12px;
+  border: 0;
+  border-radius: 12px;
+  background: var(--bg-card);
+  color: inherit;
+  text-align: left;
+}
+
+.detail-field {
+  cursor: pointer;
+}
+
+.detail-field span,
+.detail-static span {
+  color: var(--muted);
+  flex-shrink: 0;
 }
 
 .queue-card {
@@ -466,7 +589,7 @@ input {
 
 .queue-list {
   overflow-y: auto;
-  min-height: 120px;
+  height: min(56vh, 440px);
 }
 
 .queue-row.active b {
@@ -505,8 +628,55 @@ input {
   display: flex;
   justify-content: center;
   align-items: center;
-  gap: 28px;
+  gap: 8px;
   margin: 18px 0 8px;
+}
+
+.volume-dock {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.volume-slider {
+  position: absolute;
+  top: 42px;
+  left: 50%;
+  z-index: 2;
+  width: 28px;
+  height: 120px;
+  margin: 0;
+  accent-color: var(--accent);
+  transform: translateX(-50%);
+  writing-mode: vertical-lr;
+  direction: rtl;
+}
+
+.cache-setting .sleep-hint {
+  margin-left: 0;
+}
+
+.sleep-chip {
+  margin-top: 8px;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.08);
+  color: var(--muted);
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.local-cover {
+  display: grid;
+  place-items: center;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.sleep-hint {
+  margin: 0 0 10px;
 }
 
 .controls button {

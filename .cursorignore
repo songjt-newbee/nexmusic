@@ -1,0 +1,5 @@
+﻿# 编译产物与依赖：体积大且不应进入 Agent 上下文
+src-tauri/target/
+node_modules/
+dist/
+src-tauri/gen/
